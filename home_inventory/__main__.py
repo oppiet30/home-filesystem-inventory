@@ -41,12 +41,28 @@ def scan(root, mode, database):
     conn = sqlite3.connect(database)
     conn.executescript(SCHEMA)
     root_dev = root.stat().st_dev
+    started = time.monotonic()
     now = int(time.time())
-    counters = {"files": 0, "repos": 0, "archives": 0, "errors": 0}
+    counters = {"files": 0, "repos": 0, "archives": 0, "errors": 0, "bytes": 0}
     def error(exc):
         counters["errors"] += 1
         print(f"WARNING: {exc}", file=sys.stderr)
+    def record_repo(path):
+        marker = Path(path) / ".git"
+        if not (marker.is_dir() or marker.is_file()):
+            return
+        try:
+            p = subprocess.run(["git", "-C", str(path), "remote", "get-url", "origin"],
+                               capture_output=True, text=True, timeout=10, check=False)
+            origin = p.stdout.strip() if p.returncode == 0 else ""
+        except (OSError, subprocess.TimeoutExpired):
+            origin = ""
+        conn.execute("INSERT OR REPLACE INTO repositories VALUES (?,?,?)",
+                     (str(path), origin, now))
+        counters["repos"] += 1
+
     def walk(path):
+        record_repo(path)
         try:
             with os.scandir(path) as entries:
                 for entry in entries:
@@ -70,18 +86,6 @@ def scan(root, mode, database):
         for path, st in walk(root):
             if Path(path).name == ".git":
                 continue
-            parent = Path(path).parent
-            if (parent / ".git").is_dir() or (parent / ".git").is_file():
-                existing = conn.execute("SELECT 1 FROM repositories WHERE path=?", (str(parent),)).fetchone()
-                if not existing:
-                    try:
-                        p = subprocess.run(["git", "-C", str(parent), "remote", "get-url", "origin"],
-                                           capture_output=True, text=True, timeout=10, check=False)
-                        origin = p.stdout.strip() if p.returncode == 0 else ""
-                    except (OSError, subprocess.TimeoutExpired):
-                        origin = ""
-                    conn.execute("INSERT OR REPLACE INTO repositories VALUES (?,?,?)", (str(parent), origin, now))
-                    counters["repos"] += 1
             previous = conn.execute("SELECT size,mtime_ns,dev,inode,sha256 FROM files WHERE path=?", (path,)).fetchone()
             old_hash = previous[4] if previous and previous[:4] == (st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino) else None
             sha = old_hash
@@ -100,6 +104,7 @@ def scan(root, mode, database):
             conn.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?)",
                          (path, st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino, sha, now))
             counters["files"] += 1
+            counters["bytes"] += st.st_size
             if mode != "quick" and path.lower().endswith((".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz")):
                 try:
                     conn.execute("DELETE FROM archive_entries WHERE archive_path=?", (path,))
@@ -132,10 +137,12 @@ def scan(root, mode, database):
                     error(f"{path}: {exc}")
             if counters["files"] % 500 == 0:
                 conn.commit()
-                print(f"Indexed {counters['files']} files", flush=True)
+                elapsed = time.monotonic() - started
+                print(f"Indexed {counters['files']:,} files, {counters['bytes']:,} bytes, {elapsed:.1f}s elapsed", flush=True)
         conn.commit()
     finally:
         conn.close()
+    counters["elapsed_seconds"] = round(time.monotonic() - started, 2)
     print(counters)
 
 def report(database, kind):
