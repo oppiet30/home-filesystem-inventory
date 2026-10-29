@@ -1,0 +1,10 @@
+[project]
+name = "home-filesystem-inventory"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Read-only Linux filesystem inventory"
+[project.scripts]
+home-inventory = "home_inventory.__main__:main"
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
