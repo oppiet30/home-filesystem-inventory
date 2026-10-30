@@ -26,6 +26,16 @@ CREATE TABLE IF NOT EXISTS archive_entries (
 );
 """
 
+def db_path(path):
+    """Preserve invalid UTF-8 names as BLOB; retain existing TEXT keys."""
+    value = os.fsdecode(os.fspath(path))
+    return sqlite3.Binary(os.fsencode(value)) if any(0xDC80 <= ord(c) <= 0xDCFF for c in value) else value
+
+def safe_display(value):
+    if isinstance(value, bytes):
+        value = os.fsdecode(value)
+    return ascii(value) if any(0xDC80 <= ord(c) <= 0xDCFF for c in value) else str(value)
+
 def digest(stream):
     h = hashlib.sha256()
     for block in iter(lambda: stream.read(1024 * 1024), b""):
@@ -40,13 +50,22 @@ def scan(root, mode, database):
     database.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(database)
     conn.executescript(SCHEMA)
+    conn.execute("""CREATE TABLE IF NOT EXISTS file_access (
+        path BLOB PRIMARY KEY, uid INTEGER, gid INTEGER, mode INTEGER,
+        hash_status TEXT, scanned_at INTEGER NOT NULL)""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS scan_errors (
+        path BLOB, operation TEXT, message TEXT, scanned_at INTEGER NOT NULL)""")
     root_dev = root.stat().st_dev
     started = time.monotonic()
     now = int(time.time())
     counters = {"files": 0, "repos": 0, "archives": 0, "errors": 0, "bytes": 0}
-    def error(exc):
+    def error(exc, path=None, operation="scan"):
         counters["errors"] += 1
-        print(f"WARNING: {exc}", file=sys.stderr)
+        message = str(exc)
+        if path is not None:
+            conn.execute("INSERT INTO scan_errors VALUES (?,?,?,?)",
+                         (db_path(path), operation, message.encode("utf-8", "backslashreplace").decode("utf-8"), now))
+        print(f"WARNING: {ascii(message)}", file=sys.stderr)
     def record_repo(path):
         marker = Path(path) / ".git"
         if not (marker.is_dir() or marker.is_file()):
@@ -58,7 +77,7 @@ def scan(root, mode, database):
         except (OSError, subprocess.TimeoutExpired):
             origin = ""
         conn.execute("INSERT OR REPLACE INTO repositories VALUES (?,?,?)",
-                     (str(path), origin, now))
+                     (db_path(path), origin, now))
         counters["repos"] += 1
 
     def walk(path):
@@ -79,18 +98,20 @@ def scan(root, mode, database):
                         elif stat.S_ISREG(st.st_mode):
                             yield entry.path, st
                     except (OSError, PermissionError) as exc:
-                        error(exc)
+                        error(exc, entry.path, "entry")
         except (OSError, PermissionError) as exc:
-            error(exc)
+            error(exc, path, "scandir")
     try:
         for path, st in walk(root):
+            key = db_path(path)
             if Path(path).name == ".git":
                 continue
-            previous = conn.execute("SELECT size,mtime_ns,dev,inode,sha256 FROM files WHERE path=?", (path,)).fetchone()
+            previous = conn.execute("SELECT size,mtime_ns,dev,inode,sha256 FROM files WHERE path=?", (key,)).fetchone()
             old_hash = previous[4] if previous and previous[:4] == (st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino) else None
             sha = old_hash
+            hash_status = "not_requested" if mode == "quick" else "not_hashed"
             if mode == "deep" or (mode == "normal" and st.st_size > 0 and conn.execute(
-                "SELECT 1 FROM files WHERE size=? AND path<>? LIMIT 1", (st.st_size, path)).fetchone()):
+                "SELECT 1 FROM files WHERE size=? AND path<>? LIMIT 1", (st.st_size, key)).fetchone()):
                 if not sha:
                     try:
                         with open(path, "rb") as f:
@@ -98,16 +119,21 @@ def scan(root, mode, database):
                         after = os.stat(path, follow_symlinks=False)
                         if (after.st_size, after.st_mtime_ns, after.st_ino) != (st.st_size, st.st_mtime_ns, st.st_ino):
                             sha = None
-                            error(f"Changed while hashing: {path}")
+                            error("Changed while hashing", path, "hash")
                     except OSError as exc:
-                        error(exc)
+                        hash_status = "permission_denied" if isinstance(exc, PermissionError) else "read_error"
+                        error(exc, path, "hash")
+            if sha:
+                hash_status = "hashed"
+            conn.execute("INSERT OR REPLACE INTO file_access VALUES (?,?,?,?,?,?)",
+                         (key, st.st_uid, st.st_gid, stat.S_IMODE(st.st_mode), hash_status, now))
             conn.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?)",
-                         (path, st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino, sha, now))
+                         (key, st.st_size, st.st_mtime_ns, st.st_dev, st.st_ino, sha, now))
             counters["files"] += 1
             counters["bytes"] += st.st_size
             if mode != "quick" and path.lower().endswith((".zip", ".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz")):
                 try:
-                    conn.execute("DELETE FROM archive_entries WHERE archive_path=?", (path,))
+                    conn.execute("DELETE FROM archive_entries WHERE archive_path=?", (key,))
                     if zipfile.is_zipfile(path):
                         with zipfile.ZipFile(path) as archive:
                             for item in archive.infolist():
@@ -118,7 +144,7 @@ def scan(root, mode, database):
                                     with archive.open(item) as f:
                                         entry_hash = digest(f)
                                 conn.execute("INSERT OR REPLACE INTO archive_entries VALUES (?,?,?,?,?)",
-                                             (path, item.filename, item.file_size, entry_hash, now))
+                                             (key, db_path(item.filename), item.file_size, entry_hash, now))
                     elif tarfile.is_tarfile(path):
                         with tarfile.open(path, "r:*") as archive:
                             for item in archive:
@@ -131,10 +157,10 @@ def scan(root, mode, database):
                                         with f:
                                             entry_hash = digest(f)
                                 conn.execute("INSERT OR REPLACE INTO archive_entries VALUES (?,?,?,?,?)",
-                                             (path, item.name, item.size, entry_hash, now))
+                                             (key, db_path(item.name), item.size, entry_hash, now))
                     counters["archives"] += 1
                 except (OSError, ValueError, tarfile.TarError, zipfile.BadZipFile, RuntimeError, EOFError) as exc:
-                    error(f"{path}: {exc}")
+                    error(exc, path, "archive")
             if counters["files"] % 500 == 0:
                 conn.commit()
                 elapsed = time.monotonic() - started
@@ -155,7 +181,7 @@ def report(database, kind):
         else:
             rows = conn.execute("SELECT sha256,COUNT(*),SUM(size)-MAX(size) FROM files WHERE sha256 IS NOT NULL GROUP BY sha256 HAVING COUNT(*)>1 ORDER BY 3 DESC LIMIT 50")
         for row in rows:
-            print("\t".join(map(str, row)))
+            print("\t".join(safe_display(value) for value in row))
     finally:
         conn.close()
 
