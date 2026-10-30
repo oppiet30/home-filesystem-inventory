@@ -33,7 +33,7 @@ class InventoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "root"
             root.mkdir()
-            filename = os.fsencode(str(root)) + b"/invalid_\\x97.txt"
+            filename = os.fsencode(str(root)) + b"/invalid_" + bytes([0x97]) + b".txt"
             fd = os.open(filename, os.O_CREAT | os.O_WRONLY, 0o600)
             os.close(fd)
             os.chmod(filename, 0)
